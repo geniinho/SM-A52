@@ -158,17 +158,20 @@ jobs:
       - name: Ajustes no source (warnings do vendor)
         run: |
           set -euo pipefail
-          # clang 12 promove warnings de codigo antigo da Samsung/Qualcomm a erro,
-          # ex.: techpack/audio/4.0/dsp/digital-cdc-rsc-mgr.c (old-style prototype).
-          # Essas flags ficam nos Makefiles do vendor, nao na config.
-          FILES=$(grep -rl --include='Makefile' --include='Kbuild' -- '-Werror' "$KERNEL_DIR" || true)
+          # O Makefile raiz liga -Werror=strict-prototypes & cia (linhas 967-979).
+          # O KCFLAGS entra depois (linha 1001), entao desligamos por flag no passo
+          # de compilacao. Aqui so removemos o "-Werror" solto dos Makefiles do
+          # vendor (techpack etc.), sem tocar em $(call cc-option,-Werror=...),
+          # que precisa dos parenteses intactos.
+          ROOT_MK="$KERNEL_DIR/Makefile"
+          FILES=$(grep -rl --include='Makefile' --include='Kbuild' -- '-Werror' "$KERNEL_DIR" \
+            | grep -v "^$ROOT_MK$" || true)
           COUNT=$(printf '%s\n' "$FILES" | grep -c . || true)
-          echo "arquivos com -Werror: $COUNT"
+          echo "Makefiles do vendor com -Werror: $COUNT"
           if [ "$COUNT" -gt 0 ]; then
-            printf '%s\n' "$FILES" | xargs -r sed -i 's/-Werror[^[:space:]]*//g'
-            echo "removido. exemplo:"
-            printf '%s\n' "$FILES" | head -5
+            printf '%s\n' "$FILES" | xargs -r sed -i 's/\(^\|[[:space:]]\)-Werror\([[:space:]]\|$\)/\1\2/g'
           fi
+          echo "tokens -Werror soltos restantes: $(grep -rn --include='Makefile' --include='Kbuild' '\(^\|[[:space:]]\)-Werror\([[:space:]]\|$\)' "$KERNEL_DIR" | wc -l)"
 
       - name: Configurar
         run: |
@@ -242,7 +245,7 @@ jobs:
           . "$RUNNER_TEMP/make-args.sh"
           echo "inicio: $(date -u +%H:%M:%SZ)"
           make -C "$KERNEL_DIR" "${MAKE_ARGS[@]}" O="$OUT" \
-            KCFLAGS="-Wno-error -Wno-strict-prototypes" \
+            KCFLAGS="-Wno-error -Wno-strict-prototypes -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=incompatible-pointer-types -Wno-error=date-time -Wno-error=designated-init" \
             -j"$(nproc)" Image
           echo "fim: $(date -u +%H:%M:%SZ)"
           ls -lh "$OUT/arch/arm64/boot/Image"
