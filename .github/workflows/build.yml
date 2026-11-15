@@ -1,0 +1,276 @@
+name: build-kernel
+
+# Compila o kernel Samsung 4.14.190 (a52q) com Docker nativo.
+#
+# O source NAO fica no git: ele vem do asset do release "kernel-src"
+# (publish.ps1 sobe o zip oficial da Samsung para la).
+#
+# Disparo manual (publish.ps1 ou botao "Run workflow"):
+#   base=stock|defconfig   docker=true|false
+# Push que mexe em configs/ ou neste arquivo tambem dispara.
+# Push em docs/ NAO dispara, para nao gastar minutos do Actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Config base: stock (proc/config.gz do aparelho) ou defconfig (vendor)"
+        type: choice
+        options: ["stock", "defconfig"]
+        default: "stock"
+      docker:
+        description: "Aplicar configs/docker.fragment (namespaces, cgroups, overlay)"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+  push:
+    paths:
+      - "configs/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCH: arm64
+  BASE: ${{ inputs.base || 'stock' }}
+  DOCKER: ${{ inputs.docker || 'true' }}
+
+jobs:
+  build:
+    name: a52q · base ${{ inputs.base || 'stock' }} · docker ${{ inputs.docker || 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependencias do host
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 cpio kmod rsync unzip zip xz-utils curl git
+
+      - name: Baixar o source do kernel (release kernel-src)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src-zip"
+          gh release download kernel-src \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "*.zip" \
+            --dir "$RUNNER_TEMP/src-zip" \
+            --clobber
+          ls -lh "$RUNNER_TEMP/src-zip"
+
+      - name: Extrair o source
+        run: |
+          set -euo pipefail
+          echo "== extraindo o zip da Samsung"
+          mkdir -p "$RUNNER_TEMP/raw" "$RUNNER_TEMP/src"
+          ZIP=$(find "$RUNNER_TEMP/src-zip" -maxdepth 1 -name '*.zip' -print -quit)
+          if [ -z "$ZIP" ]; then echo "nenhum zip no release kernel-src"; exit 1; fi
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/raw"
+
+          # o zip da Samsung traz Kernel.tar.gz (e Platform.tar.gz, que nao usamos)
+          TAR=$(find "$RUNNER_TEMP/raw" -maxdepth 2 -type f \
+            \( -iname 'kernel*.tar.gz' -o -iname 'kernel*.tgz' -o -iname 'kernel*.tar' \) \
+            -print -quit)
+          if [ -z "$TAR" ]; then
+            TAR=$(find "$RUNNER_TEMP/raw" -maxdepth 2 -type f \
+              \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar' \) -print -quit)
+          fi
+          if [ -n "$TAR" ]; then
+            echo "tar: $TAR"
+            tar -xf "$TAR" -C "$RUNNER_TEMP/src"
+          else
+            echo "sem tar: procurando zip aninhado"
+            find "$RUNNER_TEMP/raw" -maxdepth 3 -type f -name '*.zip' \
+              -exec unzip -q {} -d "$RUNNER_TEMP/src" \;
+          fi
+
+          KERNEL_DIR=$(find "$RUNNER_TEMP/src" -maxdepth 5 -path '*/arch/arm64/Makefile' -print -quit \
+            | sed 's#/arch/arm64/Makefile$##')
+          if [ -z "$KERNEL_DIR" ]; then
+            echo "nao encontrei a arvore do kernel"; exit 1
+          fi
+          echo "KERNEL_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
+          echo "kernel em: $KERNEL_DIR"
+          head -3 "$KERNEL_DIR/Makefile"
+          du -sh "$KERNEL_DIR"
+
+      - name: Toolchain (clang 12 r416183b + GNU ld 2.27)
+        run: |
+          set -euo pipefail
+          # clang 12 do AOSP. LLD NAO pode ser usado: o kernel compila mas morre
+          # calado no boot. O linker precisa ser o GNU ld 2.27 (prebuilt gcc 4.9).
+          TC="$RUNNER_TEMP/tc"
+          mkdir -p "$TC"
+          cd "$TC"
+
+          curl -fL --retry 3 --retry-delay 3 -o clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz"
+          mkdir -p clang && tar -xzf clang.tar.gz -C clang
+
+          curl -fL --retry 3 --retry-delay 3 -o gcc.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android10-release.tar.gz"
+          mkdir -p gcc && tar -xzf gcc.tar.gz -C gcc
+
+          # o kernel chama aarch64-linux-gnu-*; o prebuilt usa o prefixo android
+          mkdir -p "$TC/bin"
+          for tool in "$TC"/gcc/bin/aarch64-linux-android-*; do
+            name=$(basename "$tool" | sed 's/^aarch64-linux-android-//')
+            ln -sf "$tool" "$TC/bin/aarch64-linux-gnu-$name"
+          done
+
+          echo "$TC/bin" >> "$GITHUB_PATH"
+          echo "$TC/clang/bin" >> "$GITHUB_PATH"
+
+          "$TC/clang/bin/clang" --version | head -1
+          "$TC/bin/aarch64-linux-gnu-ld" --version | head -1
+
+          # argumentos de build compartilhados entre os passos
+          cat > "$RUNNER_TEMP/make-args.sh" <<'EOF'
+          MAKE_ARGS=(
+            ARCH=arm64
+            CC=$TC_PLACEHOLDER/clang/bin/clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            LD=aarch64-linux-gnu-ld
+            AR=aarch64-linux-gnu-ar
+            NM=aarch64-linux-gnu-nm
+            OBJCOPY=aarch64-linux-gnu-objcopy
+            OBJDUMP=aarch64-linux-gnu-objdump
+            READELF=aarch64-linux-gnu-readelf
+            STRIP=aarch64-linux-gnu-strip
+          )
+          EOF
+          sed -i "s#TC_PLACEHOLDER#$TC#" "$RUNNER_TEMP/make-args.sh"
+          cat "$RUNNER_TEMP/make-args.sh"
+
+      - name: Configurar
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/make-args.sh"
+          OUT="$KERNEL_DIR/out"
+          mkdir -p "$OUT"
+
+          if [ "$BASE" = "stock" ]; then
+            cp "$GITHUB_WORKSPACE/configs/stock.config" "$OUT/.config"
+            echo "base: configs/stock.config (proc/config.gz do aparelho)"
+          else
+            DEF=$(cd "$KERNEL_DIR" && find arch/arm64/configs -name '*a52q*defconfig' -print -quit)
+            if [ -z "$DEF" ]; then echo "defconfig a52q nao encontrada"; exit 1; fi
+            TARGET=${DEF#arch/arm64/configs/}
+            echo "base: $TARGET"
+            make -C "$KERNEL_DIR" "${MAKE_ARGS[@]}" O="$OUT" "$TARGET"
+          fi
+
+          if [ "$DOCKER" = "true" ]; then
+            echo "aplicando configs/docker.fragment"
+            ( cd "$KERNEL_DIR" && ARCH=arm64 scripts/kconfig/merge_config.sh \
+                -m -O "$OUT" "$OUT/.config" "$GITHUB_WORKSPACE/configs/docker.fragment" )
+            echo "ARTIFACT=kernel-a52q-docker" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT=kernel-a52q" >> "$GITHUB_ENV"
+          fi
+
+          make -C "$KERNEL_DIR" "${MAKE_ARGS[@]}" O="$OUT" olddefconfig
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: Conferir a configuracao
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/make-args.sh"
+          CFG="$OUT/.config"
+          fail=0
+          need() {
+            if grep -qx "CONFIG_$1=y" "$CFG"; then printf '  ok    %s\n' "$1"
+            else printf '  FALTA %s\n' "$1"; fail=1; fi
+          }
+          avoid() {
+            if grep -qx "CONFIG_$1=y" "$CFG"; then printf '  LIGADO %s\n' "$1"; fail=1
+            else printf '  off   %s\n' "$1"; fi
+          }
+
+          echo "== precisa estar ligado (docker nativo)"
+          if [ "$DOCKER" = "true" ]; then
+            for opt in NAMESPACES UTS_NS IPC_NS PID_NS NET_NS USER_NS \
+                       CGROUPS MEMCG CGROUP_PIDS CGROUP_DEVICE \
+                       OVERLAY_FS BINFMT_MISC BRIDGE VETH SECCOMP_FILTER; do need "$opt"; done
+          fi
+          # chamadas sem #ifdef no codigo da Samsung: desligar quebra o link
+          need KNOX_NCM
+          need SEC_DEBUG
+
+          echo "== guardas da Samsung (ligados matam o boot com bootloader destravado)"
+          for opt in RKP_NS_PROT RKP_KDP RKP_DMAP_PROT UH_RKP RKP_MODULE_SUPPORT \
+                     SECURITY_DEFEX PROCA FIVE SECURITY_DSMS; do avoid "$opt"; done
+
+          echo "== armadilhas conhecidas de modpost"
+          avoid MODVERSIONS
+
+          echo "== resumo"
+          grep -c '=y' "$CFG" | sed 's/^/  opcoes ligadas: /'
+          exit $fail
+
+      - name: Compilar
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/make-args.sh"
+          echo "inicio: $(date -u +%H:%M:%SZ)"
+          make -C "$KERNEL_DIR" "${MAKE_ARGS[@]}" O="$OUT" \
+            KCFLAGS="-Wno-error" \
+            -j"$(nproc)" Image
+          echo "fim: $(date -u +%H:%M:%SZ)"
+          ls -lh "$OUT/arch/arm64/boot/Image"
+
+      - name: Empacotar
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/make-args.sh"
+          IMG="$OUT/arch/arm64/boot/Image"
+          test -s "$IMG"
+          mkdir -p artifact
+          cp "$IMG" artifact/Image
+          cp "$OUT/.config" artifact/config-final
+          ( cd artifact && sha256sum Image > Image.sha256 )
+          {
+            echo "commit: $GITHUB_SHA"
+            echo "run: $GITHUB_RUN_ID"
+            echo "base: $BASE"
+            echo "docker: $DOCKER"
+            echo "clang: $(clang --version | head -1)"
+            echo "ld: $(aarch64-linux-gnu-ld --version | head -1)"
+            echo "data: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > artifact/BUILD.txt
+          ls -lh artifact
+
+      - name: Upload do artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Resumo
+        if: always()
+        run: |
+          {
+            echo "### Kernel a52q"
+            echo ""
+            echo "- base: \`$BASE\`"
+            echo "- docker: \`$DOCKER\`"
+            echo "- artifact: \`$ARTIFACT\`"
+            if [ -s "$OUT/arch/arm64/boot/Image" ]; then
+              echo "- Image: $(du -h "$OUT/arch/arm64/boot/Image" | cut -f1)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

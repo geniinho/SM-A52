@@ -33,9 +33,32 @@ Com um token (fine-grained, permissões `Contents: write`, `Actions: write`,
 `Metadata: read`), o script `publish.ps1` cria o repositório privado, sobe os
 arquivos, cria o release `kernel-src` com o zip e dispara o build.
 
+## Como disparar
+
+**Pelo navegador:** Actions → `build-kernel` → *Run workflow*
+
+| Input | Valores | Padrão | O que faz |
+|---|---|---|---|
+| `base` | `stock` / `defconfig` | `stock` | `stock` usa `configs/stock.config` (o `/proc/config.gz` do aparelho); `defconfig` parte da defconfig de vendor da árvore |
+| `docker` | `true` / `false` | `true` | aplica `configs/docker.fragment` e publica o artifact `kernel-a52q-docker` |
+
+**Pelo script:** `.\publish.ps1 -Token ... -SourceZip ...` (envia o source como
+asset do release `kernel-src` e chama o workflow com os mesmos inputs).
+
+Push que mexe em `configs/**` ou no próprio `build.yml` também dispara. Push em
+`docs/**` **não** dispara, para não gastar minutos à toa.
+
 ## Passo 3 — pegar o resultado
 
-Actions → run `build-kernel` → artifact `kernel-a52q-docker` → contém `Image`.
+Actions → run `build-kernel` → artifact (14 dias de retenção):
+
+```
+kernel-a52q-docker/     (ou kernel-a52q quando docker=false)
+├── Image               kernel compilado (é o que vai para o boot.img)
+├── config-final        .config usado de verdade, para auditoria
+├── Image.sha256
+└── BUILD.txt           commit, inputs, versões de clang/ld, data
+```
 
 ## Passo 4 — virar boot.img e flashear (feito no PC/aparelho)
 
@@ -47,6 +70,17 @@ adb push Image /data/local/tmp/Image
 #    magiskboot unpack boot_atual.img  ->  cp Image kernel  ->  magiskboot repack
 # 3. reaplica o Magisk (patch do RKP/defex da Samsung) e flasha via Odin
 ```
+
+## Toolchain
+
+| Peça | Versão | Por quê |
+|---|---|---|
+| clang | 12.0.5 (`clang-r416183b`, prebuilt AOSP) | é a linha que a Samsung usou neste kernel |
+| binutils | GNU ld **2.27** (prebuilt gcc 4.9) | LLD compila, mas o kernel morre calado no boot |
+
+Os dois são baixados em tempo de build de `android.googlesource.com` (gitiles
+archive) e o workflow cria os symlinks `aarch64-linux-gnu-*` a partir do prefixo
+`aarch64-linux-android-*` do prebuilt.
 
 ## Opções habilitadas (configs/docker.fragment)
 
@@ -62,10 +96,22 @@ adb push Image /data/local/tmp/Image
 
 ## Guardas da Samsung (obrigatório desligar)
 
-`RKP_NS_PROT`, `RKP_KDP`, `RKP_DMAP_PROT`, `UH_RKP`, `KNOX_NCM`,
-`SECURITY_DEFEX`, `SEC_DEBUG`, `PROCA` — com bootloader destravado eles não
-protegem nada, mas o hypervisor **mata** o kernel no boot quando o texto não é o
-assinado (foi a causa do bootloop). Detalhes em `docs/APRENDIZADOS.md` §7.2 e §8.
+`RKP_NS_PROT`, `RKP_KDP`, `RKP_DMAP_PROT`, `UH_RKP`, `RKP_MODULE_SUPPORT`,
+`SECURITY_DEFEX`, `PROCA`, `FIVE`, `SECURITY_DSMS` — com bootloader destravado
+eles não protegem nada, mas o hypervisor **mata** o kernel no boot quando o texto
+não é o assinado (foi a causa do bootloop). Detalhes em
+`docs/APRENDIZADOS.md` §7.2 e §8.
+
+**Exceções que precisam ficar `=y`** (o código da Samsung chama as funções sem
+`#ifdef`, então desligar quebra o link):
+
+| Opção | Onde é chamada |
+|---|---|
+| `KNOX_NCM` | `net/core/sock.c`, `net/ipv4/udp.c` |
+| `SEC_DEBUG` | `arch/arm64/kernel/traps.c` |
+
+O workflow falha de propósito se alguma delas sair da config (`Conferir a
+configuracao`), em vez de gerar um kernel que não liga.
 
 ## Rollback
 
