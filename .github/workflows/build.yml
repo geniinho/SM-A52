@@ -24,6 +24,7 @@ on:
         options: ["true", "false"]
         default: "true"
   push:
+    branches: ["main"]
     paths:
       - "configs/**"
       - ".github/workflows/build.yml"
@@ -137,22 +138,21 @@ jobs:
           "$TC/bin/aarch64-linux-gnu-ld" --version | head -1
 
           # argumentos de build compartilhados entre os passos
-          cat > "$RUNNER_TEMP/make-args.sh" <<'EOF'
-          MAKE_ARGS=(
-            ARCH=arm64
-            CC=$TC_PLACEHOLDER/clang/bin/clang
-            CLANG_TRIPLE=aarch64-linux-gnu-
-            CROSS_COMPILE=aarch64-linux-gnu-
-            LD=aarch64-linux-gnu-ld
-            AR=aarch64-linux-gnu-ar
-            NM=aarch64-linux-gnu-nm
-            OBJCOPY=aarch64-linux-gnu-objcopy
-            OBJDUMP=aarch64-linux-gnu-objdump
-            READELF=aarch64-linux-gnu-readelf
-            STRIP=aarch64-linux-gnu-strip
-          )
-          EOF
-          sed -i "s#TC_PLACEHOLDER#$TC#" "$RUNNER_TEMP/make-args.sh"
+          {
+            echo "MAKE_ARGS=("
+            echo "  ARCH=arm64"
+            echo "  CC=$TC/clang/bin/clang"
+            echo "  CLANG_TRIPLE=aarch64-linux-gnu-"
+            echo "  CROSS_COMPILE=aarch64-linux-gnu-"
+            echo "  LD=aarch64-linux-gnu-ld"
+            echo "  AR=aarch64-linux-gnu-ar"
+            echo "  NM=aarch64-linux-gnu-nm"
+            echo "  OBJCOPY=aarch64-linux-gnu-objcopy"
+            echo "  OBJDUMP=aarch64-linux-gnu-objdump"
+            echo "  READELF=aarch64-linux-gnu-readelf"
+            echo "  STRIP=aarch64-linux-gnu-strip"
+            echo ")"
+          } > "$RUNNER_TEMP/make-args.sh"
           cat "$RUNNER_TEMP/make-args.sh"
 
       - name: Configurar
