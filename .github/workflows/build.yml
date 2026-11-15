@@ -155,6 +155,21 @@ jobs:
           } > "$RUNNER_TEMP/make-args.sh"
           cat "$RUNNER_TEMP/make-args.sh"
 
+      - name: Ajustes no source (warnings do vendor)
+        run: |
+          set -euo pipefail
+          # clang 12 promove warnings de codigo antigo da Samsung/Qualcomm a erro,
+          # ex.: techpack/audio/4.0/dsp/digital-cdc-rsc-mgr.c (old-style prototype).
+          # Essas flags ficam nos Makefiles do vendor, nao na config.
+          FILES=$(grep -rl --include='Makefile' --include='Kbuild' -- '-Werror' "$KERNEL_DIR" || true)
+          COUNT=$(printf '%s\n' "$FILES" | grep -c . || true)
+          echo "arquivos com -Werror: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            printf '%s\n' "$FILES" | xargs -r sed -i 's/-Werror[^[:space:]]*//g'
+            echo "removido. exemplo:"
+            printf '%s\n' "$FILES" | head -5
+          fi
+
       - name: Configurar
         run: |
           set -euo pipefail
@@ -227,7 +242,7 @@ jobs:
           . "$RUNNER_TEMP/make-args.sh"
           echo "inicio: $(date -u +%H:%M:%SZ)"
           make -C "$KERNEL_DIR" "${MAKE_ARGS[@]}" O="$OUT" \
-            KCFLAGS="-Wno-error" \
+            KCFLAGS="-Wno-error -Wno-strict-prototypes" \
             -j"$(nproc)" Image
           echo "fim: $(date -u +%H:%M:%SZ)"
           ls -lh "$OUT/arch/arm64/boot/Image"
