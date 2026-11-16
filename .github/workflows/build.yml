@@ -158,12 +158,17 @@ jobs:
       - name: Ajustes no source (warnings do vendor)
         run: |
           set -euo pipefail
-          # O Makefile raiz liga -Werror=strict-prototypes & cia (linhas 967-979).
-          # O KCFLAGS entra depois (linha 1001), entao desligamos por flag no passo
-          # de compilacao. Aqui so removemos o "-Werror" solto dos Makefiles do
-          # vendor (techpack etc.), sem tocar em $(call cc-option,-Werror=...),
-          # que precisa dos parenteses intactos.
+          # 1) Makefile raiz: o kernel liga estes cinco -Werror= globalmente
+          #    (implicit-int, strict-prototypes, date-time, incompatible-pointer-types,
+          #    designated-init). O codigo antigo da Samsung/Qualcomm nao passa neles.
           ROOT_MK="$KERNEL_DIR/Makefile"
+          BEFORE=$(grep -c '^KBUILD_CFLAGS.*cc-option,-Werror=' "$ROOT_MK" || true)
+          sed -i 's/^\(KBUILD_CFLAGS[[:space:]]*+=[[:space:]]*$(call cc-option,-Werror=.*\)$/# [CI] desativado: \1/' "$ROOT_MK"
+          AFTER=$(grep -c '^KBUILD_CFLAGS.*cc-option,-Werror=' "$ROOT_MK" || true)
+          echo "flags -Werror do Makefile raiz: $BEFORE -> $AFTER"
+
+          # 2) Makefiles do vendor: remove o "-Werror" solto (techpack etc.),
+          #    sem tocar em $(call cc-option,-Werror=...), que precisa dos parenteses.
           FILES=$(grep -rl --include='Makefile' --include='Kbuild' -- '-Werror' "$KERNEL_DIR" \
             | grep -v "^$ROOT_MK$" || true)
           COUNT=$(printf '%s\n' "$FILES" | grep -c . || true)
@@ -245,7 +250,7 @@ jobs:
           . "$RUNNER_TEMP/make-args.sh"
           echo "inicio: $(date -u +%H:%M:%SZ)"
           make -C "$KERNEL_DIR" "${MAKE_ARGS[@]}" O="$OUT" \
-            KCFLAGS="-Wno-error -Wno-strict-prototypes -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=incompatible-pointer-types -Wno-error=date-time -Wno-error=designated-init" \
+            KCFLAGS="-Wno-error" \
             -j"$(nproc)" Image
           echo "fim: $(date -u +%H:%M:%SZ)"
           ls -lh "$OUT/arch/arm64/boot/Image"
